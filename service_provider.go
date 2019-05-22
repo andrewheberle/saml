@@ -55,7 +55,13 @@ type ServiceProvider struct {
 
 	// Certificate is the RSA public part of Key.
 	Certificate *x509.Certificate
-
+	
+	// PreviousKey is the RSA private key we use verify requests that fail the primary in case of key rollover.
+	PreviousKey *rsa.PrivateKey
+	
+	// PreviousCertificate is the RSA public part of PreviousKey.
+	PreviousCertificate *x509.Certificate
+	
 	// MetadataURL is the full URL to the metadata endpoint on this host,
 	// i.e. https://example.com/saml/metadata
 	MetadataURL url.URL
@@ -470,20 +476,39 @@ func (sp *ServiceProvider) ParseResponse(req *http.Request, possibleRequestIDs [
 			return nil, retErr
 		}
 		var key interface{} = sp.Key
+		var previouskey interface{} = sp.PreviousKey
 		keyEl := doc.FindElement("//EncryptedAssertion/EncryptedKey")
 		if keyEl != nil {
 			key, err = xmlenc.Decrypt(sp.Key, keyEl)
 			if err != nil {
-				retErr.PrivateErr = fmt.Errorf("failed to decrypt key from response: %s", err)
-				return nil, retErr
+				// try previous key
+				if previouskey != nil {
+					previouskey, err = xmlenc.Decrypt(sp.PreviousKey, keyEl)
+					if err != nil {
+						retErr.PrivateErr = fmt.Errorf("failed to decrypt key from response using both primary and previous key: %s", err)
+						return nil, retErr
+					}
+				} else {
+					retErr.PrivateErr = fmt.Errorf("failed to decrypt key from response: %s", err)
+					return nil, retErr
+				}
 			}
 		}
 
 		el := doc.FindElement("//EncryptedAssertion/EncryptedData")
 		plaintextAssertion, err := xmlenc.Decrypt(key, el)
 		if err != nil {
-			retErr.PrivateErr = fmt.Errorf("failed to decrypt response: %s", err)
-			return nil, retErr
+			// try previous key
+			if previouskey != nil {
+				plaintextAssertion, err := xmlenc.Decrypt(previouskey, el)
+				if err != nil {
+					retErr.PrivateErr = fmt.Errorf("failed to decrypt response using both primary and previous key: %s", err)
+					return nil, retErr
+				}
+			} else {
+				retErr.PrivateErr = fmt.Errorf("failed to decrypt response: %s", err)
+				return nil, retErr
+			}
 		}
 		retErr.Response = string(plaintextAssertion)
 
